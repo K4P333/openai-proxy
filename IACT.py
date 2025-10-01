@@ -7,8 +7,8 @@ from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QPixmap, QCursor, QPainter, QPen, QColor, QBrush
 
 # URLs
-BACKEND_ASK = "http://127.0.0.1:8000/ask"
-ACTIVATE_URL = "http://127.0.0.1:8000/activate"
+BACKEND_ASK = "https://openai-proxy.onrender.com/ask"
+ACTIVATE_URL = "https://openai-proxy.onrender.com/activate"
 
 SHORTCUT_KEY = "Alt+Shift+S"
 RESULT_POPUP_DURATION = 10000  # ms
