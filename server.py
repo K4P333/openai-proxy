@@ -1,123 +1,159 @@
 # server.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import sqlite3, os, datetime, json, requests
+import os, sqlite3, datetime, jwt, hashlib, json, requests
 
-import os
-
-load_dotenv()  # Carga las variables del archivo .env
-
-
-# LEER la clave desde variable de entorno (NUNCA en el código)
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+JWT_SECRET = os.getenv("JWT_SECRET", "cambia_esto_por_un_valor_largo")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY no está definida en las variables de entorno")
+    raise RuntimeError("OPENAI_API_KEY no definida en env")
 
-# Se usa un secreto admin para crear/gestionar usuarios (define esto en Render)
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "change_this_admin_secret")
+DB = "licenses.db"
+app = FastAPI(title="Simple License Backend")
 
-DB_PATH = "usage.db"
-app = FastAPI(title="OpenAI Proxy - simple")
-
+# DB init
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-                    user_id TEXT PRIMARY KEY,
-                    token TEXT NOT NULL
-                )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS logs (
+    c.execute("""CREATE TABLE IF NOT EXISTS licenses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts TEXT,
-                    user_id TEXT,
-                    prompt TEXT,
-                    response TEXT,
-                    usage TEXT
+                    license_key TEXT UNIQUE,
+                    buyer TEXT,
+                    max_devices INTEGER DEFAULT 1,
+                    created_at TEXT,
+                    status TEXT DEFAULT 'active'
                 )""")
-    # usuario de ejemplo (puedes cambiarlo desde admin endpoint)
-    c.execute("INSERT OR IGNORE INTO users (user_id, token) VALUES (?,?)", ("nacho", "clave_usuario123"))
+    c.execute("""CREATE TABLE IF NOT EXISTS devices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    license_key TEXT,
+                    device_id TEXT,
+                    token TEXT,
+                    activated_at TEXT,
+                    last_seen TEXT,
+                    revoked INTEGER DEFAULT 0
+                )""")
     conn.commit()
     conn.close()
 
-@app.on_event("startup")
-def startup():
-    init_db()
+init_db()
 
-class AskRequest(BaseModel):
-    user_id: str
-    token: str
-    image: str  # base64
+# Helpers
+def gen_license_key():
+    s = hashlib.sha256(os.urandom(32)).hexdigest()[:20]
+    return s
 
-class CreateUser(BaseModel):
-    admin_secret: str
-    user_id: str
-    token: str
-
-@app.post("/admin/create_user")
-def create_user(req: CreateUser):
-    if req.admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Admin secret inválido")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users (user_id, token) VALUES (?,?)", (req.user_id, req.token))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
-
-@app.post("/ask")
-def ask(req: AskRequest):
-    # Validar user/token
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT token FROM users WHERE user_id = ?", (req.user_id,))
-    row = c.fetchone()
-    if not row or row[0] != req.token:
-        conn.close()
-        raise HTTPException(status_code=401, detail="Token inválido")
-
-    ts = datetime.datetime.utcnow().isoformat()
-    c.execute("INSERT INTO logs (ts, user_id, prompt) VALUES (?,?,?)", (ts, req.user_id, "[screenshot]"))
-    log_id = c.lastrowid
-    conn.commit()
-
-    # Preparar petición a OpenAI (ejemplo con data URL en el mensaje)
+def create_device_jwt(license_key, device_id, days=365):
+    now = datetime.datetime.utcnow()
     payload = {
-        "model": "gpt-4o",   # si no tienes acceso, cambia a "gpt-3.5-turbo"
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Responde solo con la respuesta a la pregunta en la imagen. No expliques."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{req.image}"}}
-                ]
-            }
-        ],
-        "max_tokens": 300
+        "license_key": license_key,
+        "device_id": device_id,
+        "iat": int(now.timestamp()),
+        "exp": int((now + datetime.timedelta(days=days)).timestamp())
     }
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
+def decode_device_jwt(token):
     try:
-        r = requests.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=60)
-        r.raise_for_status()
-        result = r.json()
-        # extraer texto si está donde esperamos
-        answer = ""
-        try:
-            answer = result["choices"][0]["message"]["content"]
-        except Exception:
-            answer = json.dumps(result)  # fallback
-        usage = result.get("usage")
-    except Exception as e:
-        c.execute("UPDATE logs SET response = ? WHERE id = ?", (f"ERROR: {e}", log_id))
-        conn.commit()
-        conn.close()
-        raise HTTPException(status_code=500, detail=str(e))
+        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except Exception:
+        return None
 
-    c.execute("UPDATE logs SET response = ?, usage = ? WHERE id = ?", (answer, json.dumps(usage), log_id))
+# API models
+class CreateLicenseReq(BaseModel):
+    buyer: str
+    max_devices: int = 1
+
+class ActivateReq(BaseModel):
+    license_key: str
+    device_id: str
+
+class AskReq(BaseModel):
+    base64_image: str
+
+# Admin endpoint (crea licencia rapidamente)
+@app.post("/admin/create_license")
+def create_license(req: CreateLicenseReq):
+    key = gen_license_key()
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("INSERT INTO licenses (license_key,buyer,max_devices,created_at) VALUES (?,?,?,?)",
+              (key, req.buyer, req.max_devices, datetime.datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
+    return {"license_key": key}
+
+# Activación: cliente envía license_key + device_id -> server emite device_token
+@app.post("/activate")
+def activate(req: ActivateReq):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT license_key, max_devices, status FROM licenses WHERE license_key = ?", (req.license_key,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="License not found")
+    if row[2] != "active":
+        conn.close()
+        raise HTTPException(status_code=403, detail="License not active")
+
+    # comprobar número de dispositivos activos
+    c.execute("SELECT COUNT(*) FROM devices WHERE license_key = ? AND revoked = 0", (req.license_key,))
+    count = c.fetchone()[0]
+    if count >= row[1]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Max devices activated for this license")
+
+    token = create_device_jwt(req.license_key, req.device_id)
+    now = datetime.datetime.utcnow().isoformat()
+    c.execute("INSERT INTO devices (license_key, device_id, token, activated_at, last_seen) VALUES (?,?,?,?,?)",
+              (req.license_key, req.device_id, token, now, now))
+    conn.commit()
+    conn.close()
+    return {"device_token": token}
+
+# Endpoint principal: recibir imagen, validar token y llamar a OpenAI
+@app.post("/ask")
+def ask(req_body: AskReq, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    token = authorization.split()[1]
+    data = decode_device_jwt(token)
+    if not data:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    license_key = data.get("license_key")
+    device_id = data.get("device_id")
+
+    # comprobar en DB device no revocado
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT id, revoked FROM devices WHERE license_key = ? AND device_id = ? AND token = ?",
+              (license_key, device_id, token))
+    row = c.fetchone()
+    if not row or row[1] == 1:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Device not authorized")
+
+    # actualizar last_seen
+    c.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (datetime.datetime.utcnow().isoformat(), row[0]))
+    conn.commit()
+    conn.close()
+
+    # Llamar a OpenAI (modelo que soporte imagenes)
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
+    payload = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role":"user", "content":[
+                {"type":"text", "text":"Responde solo con la respuesta a la pregunta en la imagen. No expliques."},
+                {"type":"image_url", "image_url": {"url": f"data:image/png;base64,{req_body.base64_image}"}}
+            ]}
+        ],
+        "max_tokens": 200
+    }
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"OpenAI error: {r.text}")
+    answer = r.json()["choices"][0]["message"]["content"]
     return {"answer": answer}

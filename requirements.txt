@@ -1,4 +1,7 @@
 fastapi
 uvicorn[standard]
+python-dotenv
 requests
-pydantic
+Pillow
+PyQt5
+PyJWT
