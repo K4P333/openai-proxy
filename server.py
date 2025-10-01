@@ -6,7 +6,7 @@ import os, sqlite3, datetime, jwt, hashlib, json, requests
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-JWT_SECRET = os.getenv("JWT_SECRET", "cambia_esto_por_un_valor_largo")
+JWT_SECRET = os.getenv("JWT_SECRET", "zPY0dzNJrAsZgXc10YsQfoRyqix7UdwwYYPZktDBCwjFc2WC42HNZ1CiI7h-rII7")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY no definida en env")
 
